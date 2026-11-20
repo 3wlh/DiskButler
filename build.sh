@@ -22,7 +22,7 @@ APP="build/DiskButler.app"
 # 原地覆盖而不是 rm -rf：某些环境下删除已签名的 App 包会报 Cross-device link
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN_DIR/DiskButler" "$APP/Contents/MacOS/DiskButler"
-# 图标（由 make_icon.sh 生成）
+# 图标（母图：Resources/AppIcon.png，已转成全尺寸 icns）
 if [ -f Resources/AppIcon.icns ]; then
     cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 fi
@@ -72,6 +72,24 @@ PLIST
 codesign --force --deep --sign - "$APP" >/dev/null 2>&1
 
 echo "✅ 已生成：$PWD/$APP"
+
+# 同时生成 DMG，附 Applications 快捷方式与安装说明
+DMG_ROOT="dmg-root"
+mkdir -p dist "$DMG_ROOT"
+rm -rf "$DMG_ROOT"/*
+cp -R "$APP" "$DMG_ROOT/"
+ln -sfn /Applications "$DMG_ROOT/Applications"
+cat > "$DMG_ROOT/安装说明.txt" <<'README'
+DiskButler 内测构建
+
+安装方式
+1. 将 "DiskButler.app" 拖到 Applications。
+2. 打开“终端”，执行下面的命令清理隔离属性：
+   xattr -cr "/Applications/DiskButler.app"
+3. 从 Applications 打开 DiskButler。
+README
+hdiutil create -volname DiskButler -srcfolder "$DMG_ROOT" -ov -format UDZO "dist/DiskButler.dmg" >/dev/null
+echo "✅ 已生成：$PWD/dist/DiskButler.dmg"
 
 if [ "${1:-}" = "--install" ]; then
     echo "—— 安装到 /Applications ——"

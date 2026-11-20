@@ -58,18 +58,14 @@ jobs:
             echo "DISKBUTLER_VERSION=$(TZ=Asia/Shanghai date +%y.%m.%d)" >> "$GITHUB_ENV"
           fi
 
-      - name: Build DiskButler.app
+      - name: Build app and DMG
         run: bash build.sh
 
-      - name: Package DMG
+      - name: Verify and rename DMG
         run: |
           set -euo pipefail
-          mkdir -p dist dmg-root
-          rm -rf dmg-root/*
-          cp -R build/DiskButler.app dmg-root/
-          ln -s /Applications dmg-root/Applications
           DMG="dist/DiskButler-${ARTIFACT_SUFFIX}-${DISKBUTLER_VERSION}.dmg"
-          hdiutil create -volname DiskButler -srcfolder dmg-root -ov -format UDZO "$DMG"
+          mv dist/DiskButler.dmg "$DMG"
           hdiutil verify "$DMG"
 
       - name: Upload packaged artifact
