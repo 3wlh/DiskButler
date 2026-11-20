@@ -60,12 +60,6 @@ BUILD_CONFIGURATION=debug ./build.sh
 /Library/Application Support/DiskButler/DiskButler.json
 ```
 
-守护日志位于：
-
-```text
-/Library/Logs/DiskButler.log
-```
-
 ## GitHub Actions
 
 在 **Actions → Package macOS → Run workflow** 中手动触发，可选择 `release` 或 `debug`。工作流分别构建 arm64、x86_64 DMG，上传 Artifacts 并发布到 GitHub Releases。

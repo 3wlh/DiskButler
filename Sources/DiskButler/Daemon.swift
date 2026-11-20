@@ -345,18 +345,8 @@ enum Daemon {
         handOver(path, fallbackOwner: "")
     }
 
-    /// 守护日志：root 写 /Library/Logs，普通用户写 /tmp（便于排查）
-    private static func log(_ message: String) {
-        let line = "\(Date().formatted(date: .omitted, time: .standard)) \(message)\n"
-        let path = getuid() == 0 ? "/Library/Logs/DiskButler.log" : "/tmp/diskbutler-daemon.log"
-        if let fh = FileHandle(forWritingAtPath: path) {
-            fh.seekToEndOfFile()
-            fh.write(line.data(using: .utf8) ?? Data())
-            try? fh.close()
-        } else {
-            try? line.write(toFile: path, atomically: true, encoding: .utf8)
-        }
-    }
+    /// 不输出守护日志（Release 与 Debug 均不落盘）
+    private static func log(_: String) {}
 
     // MARK: - 内存盘
 
