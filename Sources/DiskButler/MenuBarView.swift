@@ -1,5 +1,4 @@
 import SwiftUI
-import AppKit
 
 struct MenuBarView: View {
     @EnvironmentObject var state: AppState
@@ -22,9 +21,9 @@ struct MenuBarView: View {
         }
         .padding(12)
         .frame(width: 390)
-        .alert("关闭开机启动？", isPresented: $confirmUninstallService) {
+        .alert("卸载守护程序？", isPresented: $confirmUninstallService) {
             Button("取消", role: .cancel) {}
-            Button("关闭并卸载", role: .destructive) { state.uninstallService() }
+            Button("卸载", role: .destructive) { state.uninstallService() }
         } message: {
             Text("将停止后台服务（不再开机挂载、回挂）；已有的登记、隐藏设置会保留，重新开启后继续生效。")
         }
@@ -152,7 +151,7 @@ struct MenuBarView: View {
                     .foregroundStyle(.orange)
             }
             HStack {
-                Toggle("开机启动", isOn: Binding(
+                Toggle("安装守护程序", isOn: Binding(
                     get: { state.serviceInstalled },
                     set: { on in
                         if on {
@@ -179,9 +178,6 @@ struct MenuBarView: View {
                 .toggleStyle(.checkbox)
                 .font(.caption)
                 .help("系统级设置：开启后，即使停在登录窗口（无用户登录），外置硬盘也会自动挂载；关闭则等用户登录后才挂载")
-                Spacer()
-                Button("退出") { NSApplication.shared.terminate(nil) }
-                    .font(.caption)
             }
         }
     }

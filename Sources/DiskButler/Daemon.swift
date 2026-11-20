@@ -62,8 +62,6 @@ enum Daemon {
         startWatching()
         startNotifier()
         startConsoleUserWatch()
-        // 已登录时（例如升级重装、手动重启守护）也直接把菜单栏 App 拉起来
-        launchMenuBarApp()
         log("常驻等待事件")
         RunLoop.main.run()
     }
@@ -233,47 +231,7 @@ enum Daemon {
 
     static func handleConsoleUserChange() {
         log("登录用户变化，跑一轮")
-        launchMenuBarApp()
         schedulePass()
-    }
-
-    /// 登录后由 root 守护把菜单栏 App 拉进用户会话：只有右上角图标，主窗口不自动打开。
-    /// 登录瞬间 /dev/console、gui/<uid> 域和 LaunchServices 都可能还没就绪，open 会静默失败，
-    /// 所以这里带重试：直到进程真的出现在该用户会话里为止
-    private static let uiQueue = DispatchQueue(label: "com.local.diskbutler.ui")
-    private static var uiLaunchToken = 0
-
-    private static func launchMenuBarApp() {
-        let app = Bundle.main.bundlePath
-        let exe = Bundle.main.executableURL?.lastPathComponent ?? "DiskButler"
-        uiQueue.async {
-            uiLaunchToken += 1
-            let token = uiLaunchToken
-            for _ in 0..<10 {
-                // 期间又来了新的登录事件，让新的一轮负责
-                if token != uiLaunchToken { return }
-                guard let user = consoleUser() else {
-                    Thread.sleep(forTimeInterval: 1)
-                    continue
-                }
-                let uid = Shell.out("/usr/bin/id", ["-u", user]).trimmingCharacters(in: .whitespacesAndNewlines)
-                if !uid.isEmpty {
-                    let r = Shell.run("/bin/launchctl", ["asuser", uid, "/usr/bin/open", "-g", "-a", app])
-                    if r.code == 0 {
-                        // open 成功也可能只是请求被接收，确认进程确实起来了
-                        Thread.sleep(forTimeInterval: 0.5)
-                        let pids = Shell.out("/usr/bin/pgrep", ["-U", uid, "-x", exe])
-                            .trimmingCharacters(in: .whitespacesAndNewlines)
-                        if !pids.isEmpty {
-                            log("菜单栏 App 已启动 uid=\(uid)")
-                            return
-                        }
-                    }
-                }
-                Thread.sleep(forTimeInterval: 1)
-            }
-            log("菜单栏 App 启动失败：重试用尽")
-        }
     }
 
     // MARK: - 通知通道（notifyd，不落盘）

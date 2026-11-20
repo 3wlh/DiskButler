@@ -8,10 +8,10 @@ enum ServiceInstaller {
     static let uiLabel = "com.local.diskbutler.ui"
     static let daemonPlist = "/Library/LaunchDaemons/\(daemonLabel).plist"
     static let loginPlist = "/Library/LaunchAgents/\(loginLabel).plist"
-    /// 登录后自动打开菜单栏 App（否则重启电脑后右上角没有图标）
+    /// 旧版「登录后自动打开菜单栏 App」的残留文件，安装时清理
     static let uiPlist = "/Library/LaunchAgents/\(uiLabel).plist"
     /// 守护逻辑版本：plist 里带这个标记，二进制行为升级后界面才会提示「升级」
-    static let daemonVersion = 6
+    static let daemonVersion = 7
 
     static var binaryPath: String {
         Bundle.main.executablePath ?? "/Applications/DiskButler.app/Contents/MacOS/DiskButler"
