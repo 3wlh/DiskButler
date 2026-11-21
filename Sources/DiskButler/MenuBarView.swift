@@ -241,15 +241,19 @@ private struct VolumeRow: View {
                 Button(volume.nobrowse ? "在访达中恢复显示（取消 nobrowse）" : "在访达中隐藏（nobrowse 重挂）") {
                     state.toggleNobrowse(volume)
                 }
+                .disabled(!state.registeredUUIDs.contains(volume.uuid.uppercased()))
+                .help(state.registeredUUIDs.contains(volume.uuid.uppercased())
+                      ? "以 nobrowse 重挂，不在桌面和访达显示"
+                      : "先启动服务（登记该卷）后才能使用 nobrowse")
                 Button("修复权限（把盘交还当前用户）") { state.fixOwner(volume) }
             } else if !volume.deviceNode.isEmpty {
                 Button("挂载") { state.mount(volume) }
             }
             Divider()
             if volume.registered {
-                Button("取消登记回挂") { state.unregister(volume) }
+                Button("停止服务") { state.unregister(volume) }
             } else {
-                Button("登记回挂") { state.register(volume) }
+                Button("启动服务") { state.register(volume) }
             }
         } label: {
             Image(systemName: "ellipsis.circle")

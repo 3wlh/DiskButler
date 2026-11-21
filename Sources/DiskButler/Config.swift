@@ -3,10 +3,70 @@ import Foundation
 /// 全部配置集中保存为一个 JSON：/Library/Application Support/DiskButler/DiskButler.json
 /// 目录由守护/安装脚本创建并交给登录用户：App（普通用户）与 root 守护都能读写
 struct DiskConfig: Codable, Equatable {
+    /// 一个登记卷的全部配置
     struct Volume: Codable, Equatable {
         var label: String
         var uuid: String
-        var owner: String = ""
+        /// 以 nobrowse 挂载（不在桌面和访达显示）
+        var nobrowse: Bool = false
+        /// 最近一次创建的入口位置（原始值，可含 ~）；空表示还没创建
+        var entryPath: String = ""
+        /// 在访达里阻止推出
+        var protectEject: Bool = true
+
+        init(label: String, uuid: String, nobrowse: Bool = false,
+             entryPath: String = "", protectEject: Bool = true) {
+            self.label = label
+            self.uuid = uuid
+            self.nobrowse = nobrowse
+            self.entryPath = entryPath
+            self.protectEject = protectEject
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case label, uuid, nobrowse, entryPath, protectEject
+            // 旧版字段：只用于读取时迁移
+            case entryLink
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            label = try c.decodeIfPresent(String.self, forKey: .label) ?? ""
+            uuid = try c.decodeIfPresent(String.self, forKey: .uuid) ?? ""
+            nobrowse = try c.decodeIfPresent(Bool.self, forKey: .nobrowse) ?? false
+            entryPath = try c.decodeIfPresent(String.self, forKey: .entryPath) ?? ""
+            protectEject = try c.decodeIfPresent(Bool.self, forKey: .protectEject) ?? true
+            // 旧配置把「已创建」单独存在 entryLink，合并成一个字段
+            if entryPath.isEmpty,
+               let link = try c.decodeIfPresent(String.self, forKey: .entryLink) {
+                entryPath = link
+            }
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(label, forKey: .label)
+            try c.encode(uuid, forKey: .uuid)
+            try c.encode(nobrowse, forKey: .nobrowse)
+            try c.encode(entryPath, forKey: .entryPath)
+            try c.encode(protectEject, forKey: .protectEject)
+        }
+    }
+
+    /// 内存盘（tmpfs）的全部配置
+    struct Memory: Codable, Equatable {
+        /// 大小（GB）
+        var sizeGB: Int?
+        /// 开机是否自动创建
+        var autoCreate: Bool?
+        /// 内存盘目录 → 链接位置
+        var links: [Link]?
+
+        init(sizeGB: Int? = nil, autoCreate: Bool? = nil, links: [Link]? = nil) {
+            self.sizeGB = sizeGB
+            self.autoCreate = autoCreate
+            self.links = links
+        }
     }
 
     struct Link: Codable, Equatable {
@@ -14,28 +74,63 @@ struct DiskConfig: Codable, Equatable {
         var target: String
     }
 
-    /// 登记回挂的卷
+    /// 登记回挂的卷：nobrowse、入口、防止推出都跟着各自的卷
     var volumes: [Volume] = []
-    /// 内存盘大小（GB）
-    var memorySizeGB: Int?
-    /// 开机是否自动创建内存盘
-    var memoryAutoCreate: Bool?
-    /// 内存盘目录 → 链接位置
-    var memoryLinks: [Link]?
-    /// 以 nobrowse 挂载的卷 UUID
-    var nobrowse: [String]?
-    /// 登记卷阻止在访达中推出
-    var protectEject: Bool?
-    /// 各卷的入口位置（UUID → 路径，如 ~/DataDisk）
-    var entryPaths: [String: String]?
-    /// 「防止推出」放行时刻：写入后 15 秒内允许卸载，代替旧的标记文件
-    var bypassSince: Double?
-    /// 各卷实际已创建的入口（UUID → 路径），用于改位置时删掉旧链接
-    var entryLinks: [String: String]?
+    /// 内存盘配置
+    var memory: Memory?
     /// 待处理的「修复权限」请求（挂载点路径），守护执行后清空
     var fixRequest: String?
-    /// 期望的系统级「未登录也自动挂载硬盘」设置（由守护写入 autodiskmount.plist）
-    var autoMountNoLogin: Bool?
+
+    init() {}
+
+    private enum CodingKeys: String, CodingKey {
+        case volumes, memory, fixRequest
+        // 旧版顶层字段：只用于读取时迁移
+        case nobrowse, protectEject, entryPaths, entryLinks
+        case memorySizeGB, memoryAutoCreate, memoryLinks
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        volumes = try c.decodeIfPresent([Volume].self, forKey: .volumes) ?? []
+        memory = try c.decodeIfPresent(Memory.self, forKey: .memory)
+        fixRequest = try c.decodeIfPresent(String.self, forKey: .fixRequest)
+
+        // 旧配置迁移：内存盘三个顶层字段合成 memory 块
+        if memory == nil {
+            let size = try c.decodeIfPresent(Int.self, forKey: .memorySizeGB)
+            let auto = try c.decodeIfPresent(Bool.self, forKey: .memoryAutoCreate)
+            let links = try c.decodeIfPresent([Link].self, forKey: .memoryLinks)
+            if size != nil || auto != nil || links != nil {
+                memory = Memory(sizeGB: size, autoCreate: auto, links: links)
+            }
+        }
+
+        // 旧配置迁移：nobrowse 列表、入口映射、整体防止推出开关折进各卷
+        let legacyNobrowse = try c.decodeIfPresent([String].self, forKey: .nobrowse)?
+            .map { $0.uppercased() }
+        let legacyPaths = try c.decodeIfPresent([String: String].self, forKey: .entryPaths) ?? [:]
+        let legacyLinks = try c.decodeIfPresent([String: String].self, forKey: .entryLinks) ?? [:]
+        let legacyProtect = try c.decodeIfPresent(Bool.self, forKey: .protectEject)
+        for i in volumes.indices {
+            let key = volumes[i].uuid.uppercased()
+            if let list = legacyNobrowse {
+                volumes[i].nobrowse = list.contains(key)
+            }
+            if volumes[i].entryPath.isEmpty {
+                // 旧配置的「已创建」优先于「配置值」
+                volumes[i].entryPath = legacyLinks[key] ?? legacyPaths[key] ?? ""
+            }
+            if let p = legacyProtect { volumes[i].protectEject = p }
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encodeIfPresent(memory, forKey: .memory)
+        try c.encode(volumes, forKey: .volumes)
+        try c.encodeIfPresent(fixRequest, forKey: .fixRequest)
+    }
 }
 
 /// 系统级自动挂载开关：diskarbitrationd 读这个键决定登录窗口是否挂载硬盘
@@ -74,12 +169,79 @@ enum ConfigStore {
     static func write(_ c: DiskConfig) {
         let fm = FileManager.default
         try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
-        let enc = JSONEncoder()
-        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
-        guard let data = try? enc.encode(c) else { return }
+        guard let data = encode(c).data(using: .utf8) else { return }
         try? data.write(to: URL(fileURLWithPath: path), options: .atomic)
         try? fm.setAttributes([.posixPermissions: 0o644], ofItemAtPath: path)
         handToConsoleUser()
+    }
+
+    /// 手写序列化：JSONEncoder 不保证键顺序，这里固定成便于阅读的顺序
+    private static func encode(_ c: DiskConfig) -> String {
+        var sections: [String] = []
+
+        if let m = c.memory {
+            var lines = ["    \"memory\" : {"]
+            var fields: [String] = []
+            if let gb = m.sizeGB { fields.append("        \"sizeGB\" : \(gb)") }
+            if let auto = m.autoCreate { fields.append("        \"autoCreate\" : \(auto)") }
+            if let links = m.links {
+                if links.isEmpty {
+                    fields.append("        \"links\" : []")
+                } else {
+                    let items = links.map {
+                        "            {\n                \"dir\" : \(quote($0.dir)),\n                \"target\" : \(quote($0.target))\n            }"
+                    }
+                    fields.append("        \"links\" : [\n" + items.joined(separator: ",\n") + "\n        ]")
+                }
+            }
+            lines.append(fields.joined(separator: ",\n"))
+            lines.append("    }")
+            sections.append(lines.joined(separator: "\n"))
+        }
+
+        if c.volumes.isEmpty {
+            sections.append("    \"volumes\" : []")
+        } else {
+            let items = c.volumes.map { v in
+                [
+                    "        {",
+                    "            \"label\" : \(quote(v.label)),",
+                    "            \"uuid\" : \(quote(v.uuid)),",
+                    "            \"nobrowse\" : \(v.nobrowse),",
+                    "            \"entryPath\" : \(quote(v.entryPath)),",
+                    "            \"protectEject\" : \(v.protectEject)",
+                    "        }"
+                ].joined(separator: "\n")
+            }
+            sections.append("    \"volumes\" : [\n" + items.joined(separator: ",\n") + "\n    ]")
+        }
+
+        if let fix = c.fixRequest {
+            sections.append("    \"fixRequest\" : \(quote(fix))")
+        }
+
+        return "{\n" + sections.joined(separator: ",\n") + "\n}\n"
+    }
+
+    /// JSON 字符串字面量（处理引号、反斜杠与控制字符）
+    private static func quote(_ s: String) -> String {
+        var out = "\""
+        for ch in s.unicodeScalars {
+            switch ch {
+            case "\"": out += "\\\""
+            case "\\": out += "\\\\"
+            case "\n": out += "\\n"
+            case "\r": out += "\\r"
+            case "\t": out += "\\t"
+            default:
+                if ch.value < 0x20 {
+                    out += String(format: "\\u%04x", ch.value)
+                } else {
+                    out.unicodeScalars.append(ch)
+                }
+            }
+        }
+        return out + "\""
     }
 
     /// root 写过的文件普通用户改不动（rename 也被拒），
@@ -116,10 +278,25 @@ enum ConfigStore {
     }
 }
 
+/// 「防止推出」的 15 秒放行窗口：用标记文件的修改时间表示，不写进配置文件
+enum Bypass {
+    static let path = ConfigStore.dir + "/.bypass"
+
+    static func mark() {
+        try? Data().write(to: URL(fileURLWithPath: path), options: .atomic)
+    }
+
+    static var active: Bool {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+              let date = attrs[.modificationDate] as? Date else { return false }
+        return Date().timeIntervalSince(date) < 15
+    }
+}
+
 /// nobrowse 卷的入口链接：App 手动创建与守护回挂共用同一套位置与去重逻辑
 enum EntryLinks {
     static func raw(uuid: String, label: String, config: DiskConfig) -> String {
-        let custom = (config.entryPaths ?? [:])[uuid.uppercased()] ?? ""
+        let custom = config.volumes.first { $0.uuid.uppercased() == uuid.uppercased() }?.entryPath ?? ""
         return custom.isEmpty ? "~/\(label)" : custom
     }
 
@@ -137,7 +314,7 @@ enum EntryLinks {
         guard !path.isEmpty, path != "/" else { return }
         let fm = FileManager.default
 
-        let oldRaw = (cfg.entryLinks ?? [:])[key] ?? ""
+        let oldRaw = cfg.volumes.first { $0.uuid.uppercased() == key }?.entryPath ?? ""
         if !oldRaw.isEmpty {
             let oldPath = expand(oldRaw, home: home)
             if oldPath != path,
@@ -157,10 +334,10 @@ enum EntryLinks {
                 return
             }
         }
-        ConfigStore.update {
-            var m = $0.entryLinks ?? [:]
-            m[key] = raw
-            $0.entryLinks = m
+        ConfigStore.update { c in
+            if let i = c.volumes.firstIndex(where: { $0.uuid.uppercased() == key }) {
+                c.volumes[i].entryPath = raw
+            }
         }
     }
 }

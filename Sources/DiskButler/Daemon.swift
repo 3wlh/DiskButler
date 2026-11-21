@@ -43,9 +43,9 @@ enum Daemon {
     private static var passRunning = false
     private static var passAgain = false
 
-    /// 「防止推出」放行 15 秒：写进 JSON 配置，不再用标记文件
+    /// 「防止推出」放行 15 秒：给标记文件打时间戳，不写进 JSON 配置
     static func allowUnmountFor15s() {
-        ConfigStore.update { $0.bypassSince = Date().timeIntervalSince1970 }
+        Bypass.mark()
     }
 
     static func run(_ args: [String]) {
@@ -93,7 +93,6 @@ enum Daemon {
     /// 一轮完整工作：内存盘 / 回挂 / 交还权限 / 修复请求
     static func performPass() {
         ConfigStore.handToConsoleUser()
-        applyAutoMountPreference()
         applyFixRequest()
         // 「自动创建」关着时，已挂载的内存盘卸掉
         if !MemoryDisk.autoCreate && MemoryDisk.isMounted {
@@ -101,14 +100,6 @@ enum Daemon {
         }
         mountMemory()
         restoreVolumes()
-    }
-
-    /// 把 App 里设置的「未登录自动挂载」写进系统 plist（需 root）
-    private static func applyAutoMountPreference() {
-        guard let want = ConfigStore.read().autoMountNoLogin, want != AutoMount.withoutLogin else { return }
-        _ = Shell.run("/usr/bin/defaults", ["write", AutoMount.domain, "AutomountDisksWithoutUserLogin",
-                                            "-bool", want ? "true" : "false"])
-        log("系统未登录自动挂载已设为 \(want)")
     }
 
     /// 卸载内存盘（root 执行）：先删掉映射链接，再 umount
@@ -143,9 +134,12 @@ enum Daemon {
 
     private static func setNobrowse(uuid: String, on: Bool) {
         guard !uuid.isEmpty else { return }
-        var list = VolumeScanner.persistedNobrowse()
-        if on { list.insert(uuid) } else { list.remove(uuid) }
-        ConfigStore.update { $0.nobrowse = list.sorted() }
+        let key = uuid.uppercased()
+        ConfigStore.update { c in
+            if let i = c.volumes.firstIndex(where: { $0.uuid.uppercased() == key }) {
+                c.volumes[i].nobrowse = on
+            }
+        }
 
         guard let info = VolumeScanner.plist(uuid),
               let dev = info["DeviceNode"] as? String, !dev.isEmpty else {
@@ -288,15 +282,15 @@ enum Daemon {
     }
 
     static func approve(_ disk: DADisk) -> Unmanaged<DADissenter>? {
-        guard protectionEnabled(), !bypassActive() else { return nil }
+        guard !bypassActive() else { return nil }
         guard let desc = DADiskCopyDescription(disk) as? [String: Any] else { return nil }
         var matched = false
         if let raw = desc[kDADiskDescriptionVolumeUUIDKey as String] {
             let uuid = (CFUUIDCreateString(kCFAllocatorDefault, raw as! CFUUID) as String).uppercased()
-            matched = registeredUUIDs().contains(uuid)
+            matched = protectedUUIDs().contains(uuid)
         } else if let media = desc[kDADiskDescriptionMediaBSDNameKey as String] as? String {
-            // 整盘推出时 DA 给的是 media（没有卷 UUID）：看有没有登记卷挂在它上面
-            matched = registeredDevice(onMedia: media)
+            // 整盘推出时 DA 给的是 media（没有卷 UUID）：看有没有开了保护的登记卷挂在它上面
+            matched = protectedDevice(onMedia: media)
         }
         guard matched else { return nil }
         log("阻止推出 \(desc[kDADiskDescriptionMediaNameKey as String] as? String ?? "?")")
@@ -306,28 +300,23 @@ enum Daemon {
         return Unmanaged.passRetained(dissenter)
     }
 
-    /// 是否有登记卷位于该物理盘上（设备名形如 disk7s1，父设备 disk7）
-    private static func registeredDevice(onMedia media: String) -> Bool {
-        for uuid in registeredUUIDs() {
-            guard let info = VolumeScanner.plist(uuid),
+    /// 是否有开了「防止推出」的登记卷位于该物理盘上（设备名形如 disk7s1，父设备 disk7）
+    private static func protectedDevice(onMedia media: String) -> Bool {
+        for entry in ConfigStore.read().volumes where entry.protectEject {
+            guard let info = VolumeScanner.plist(entry.uuid),
                   let dev = info["DeviceNode"] as? String else { continue }
             if dev.hasPrefix("/dev/\(media)s") { return true }
         }
         return false
     }
 
-    private static func protectionEnabled() -> Bool {
-        ConfigStore.read().protectEject ?? true
+    private static func protectedUUIDs() -> Set<String> {
+        Set(ConfigStore.read().volumes.filter { $0.protectEject }.map { $0.uuid.uppercased() })
     }
 
-    /// 放行窗口：bypassSince 写入后 15 秒内有效
+    /// 放行窗口：标记文件写入后 15 秒内有效
     private static func bypassActive() -> Bool {
-        guard let t = ConfigStore.read().bypassSince else { return false }
-        return Date().timeIntervalSince1970 - t < 15
-    }
-
-    private static func registeredUUIDs() -> Set<String> {
-        Set(ConfStore.load().map { $0.uuid.uppercased() })
+        Bypass.active
     }
 
     /// 请求守护对指定卷交还属主（写在配置里，随通知一起交给守护）
@@ -336,7 +325,7 @@ enum Daemon {
         guard path.hasPrefix("/Volumes/") else { return }
         ConfigStore.update { $0.fixRequest = nil }
         log("修复权限请求：\(path)")
-        handOver(path, fallbackOwner: "")
+        handOver(path)
     }
 
     /// 不输出守护日志（Release 与 Debug 均不落盘）
@@ -412,7 +401,7 @@ enum Daemon {
                     EntryLinks.ensure(uuid: entry.uuid.uppercased(), label: entry.label,
                                       mountPoint: mp, home: "/Users/\(user)")
                 }
-                handOver(mp, fallbackOwner: entry.owner)
+                handOver(mp)
                 return false
             }
             if pending.isEmpty { return }
@@ -420,10 +409,10 @@ enum Daemon {
         }
     }
 
-    /// 卷根 + 首层 root 属主目录交还当前登录用户（取不到时退回登记时记下的 UID:GID）
-    private static func handOver(_ mp: String, fallbackOwner: String) {
+    /// 卷根 + 首层 root 属主目录交还当前登录用户；登录前不做任何处理
+    private static func handOver(_ mp: String) {
         guard mp.hasPrefix("/Volumes/") else { return }
-        guard let owner = consoleOwner() ?? validOwner(fallbackOwner) else { return }
+        guard let owner = consoleOwner() else { return }
         if statOwner(mp) != owner {
             let r = Shell.run("/usr/sbin/chown", [owner, mp])
             if r.code != 0 {
@@ -462,13 +451,6 @@ enum Daemon {
         let name = Shell.out("/usr/bin/stat", ["-f", "%Su", "/dev/console"])
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return name.isEmpty || name == "root" || name == "loginwindow" ? nil : name
-    }
-
-    private static func validOwner(_ raw: String) -> String? {
-        let owner = raw.filter { $0.isNumber || $0 == ":" }
-        let parts = owner.split(separator: ":")
-        guard parts.count == 2, let uid = Int(parts[0]), uid != 0 else { return nil }
-        return owner
     }
 }
 

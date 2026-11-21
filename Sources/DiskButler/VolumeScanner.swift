@@ -69,7 +69,7 @@ enum VolumeScanner {
 
     /// nobrowse 的持久偏好（记在同一个 JSON 配置里）
     static func persistedNobrowse() -> Set<String> {
-        Set((ConfigStore.read().nobrowse ?? []).map { $0.uppercased() })
+        Set(ConfigStore.read().volumes.filter { $0.nobrowse }.map { $0.uuid.uppercased() })
     }
 
     /// 当前挂载是否带 nobrowse（mount 行里可见）

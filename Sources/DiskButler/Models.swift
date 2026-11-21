@@ -1,10 +1,9 @@
 import Foundation
 
-/// 回挂配置中的一条登记：名称|UUID|UID:GID
+/// 回挂配置中的一条登记：名称|UUID
 struct ConfEntry: Identifiable, Hashable {
     var label: String
     var uuid: String
-    var owner: String
     var id: String { uuid }
 }
 

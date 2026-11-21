@@ -11,21 +11,30 @@ enum MemoryDisk {
         var id: String { dir + "|" + target }
     }
 
-    static var autoCreate: Bool { ConfigStore.read().memoryAutoCreate ?? true }
+    /// 修改内存盘配置块（没有就新建）
+    private static func updateMemory(_ mutate: (inout DiskConfig.Memory) -> Void) {
+        ConfigStore.update { c in
+            var m = c.memory ?? DiskConfig.Memory()
+            mutate(&m)
+            c.memory = m
+        }
+    }
+
+    static var autoCreate: Bool { ConfigStore.read().memory?.autoCreate ?? true }
 
     static func setAutoCreate(_ on: Bool) {
-        ConfigStore.update { $0.memoryAutoCreate = on }
+        updateMemory { $0.autoCreate = on }
     }
 
     static func links() -> [Link] {
-        let list = ConfigStore.read().memoryLinks
+        let list = ConfigStore.read().memory?.links
             ?? [DiskConfig.Link(dir: "Downloads", target: "~/Downloads/DownloadsRAM")]
         return list.map { Link(dir: $0.dir, target: $0.target) }
     }
 
     static func saveLinks(_ list: [Link]) {
-        ConfigStore.update {
-            $0.memoryLinks = list.map { DiskConfig.Link(dir: $0.dir, target: $0.target) }
+        updateMemory { m in
+            m.links = list.map { DiskConfig.Link(dir: $0.dir, target: $0.target) }
         }
     }
 
@@ -39,7 +48,7 @@ enum MemoryDisk {
 
     /// 当前设置的大小（GB）
     static var sizeGB: Int {
-        let v = ConfigStore.read().memorySizeGB ?? defaultSizeGB
+        let v = ConfigStore.read().memory?.sizeGB ?? defaultSizeGB
         return min(max(1, v), physicalGB)
     }
 
@@ -47,7 +56,7 @@ enum MemoryDisk {
 
     static func setSizeGB(_ gb: Int) {
         let v = min(max(1, gb), physicalGB)
-        ConfigStore.update { $0.memorySizeGB = v }
+        updateMemory { $0.sizeGB = v }
     }
 
     // MARK: - 状态

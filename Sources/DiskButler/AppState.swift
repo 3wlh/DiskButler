@@ -7,6 +7,8 @@ final class AppState: ObservableObject {
     @Published var serviceInstalled = false
     @Published var serviceNeedsUpgrade = false
     @Published var registeredCount = 0
+    /// 已登记回挂的卷 UUID（大写），用于判断 nobrowse 等配置是否可写
+    @Published var registeredUUIDs: Set<String> = []
     @Published var memoryMounted = false
     @Published var memorySizeGB = MemoryDisk.sizeGB
     @Published var memoryAuto = MemoryDisk.autoCreate
@@ -16,8 +18,8 @@ final class AppState: ObservableObject {
     @Published var busy = false
     /// 防止推出（登记卷被 Finder 推出时由守护拦下）
     @Published var protectEject = true
-    /// 系统级：无用户登录时也自动挂载硬盘（autodiskmount.plist）
-    @Published var autoMountNoLogin = false
+    /// 系统级：无用户登录时也自动挂载硬盘（autodiskmount.plist，启动时读一次，之后由文件监听同步）
+    @Published var autoMountNoLogin = AutoMount.withoutLogin
     /// 各卷入口位置（UUID → 路径，留空表示默认 ~/卷名）
     @Published var entryPaths: [String: String] = [:]
 
@@ -31,6 +33,7 @@ final class AppState: ObservableObject {
         Daemon.tick(Daemon.tickPass)
         // 事件驱动：/Volumes 变化（插入、拔出、挂载、卸载、内存盘创建）+ 系统挂载通知
         watchVolumes()
+        watchAutoMount()
         let nc = NSWorkspace.shared.notificationCenter
         for name in [NSWorkspace.didMountNotification, NSWorkspace.didUnmountNotification] {
             nc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
@@ -50,6 +53,28 @@ final class AppState: ObservableObject {
         )
         src.setEventHandler { [weak self] in
             Task { @MainActor in self?.scheduleRefresh() }
+        }
+        src.setCancelHandler { close(fd) }
+        src.resume()
+        watchers.append(src)
+    }
+
+    /// 监听 autodiskmount.plist 所在目录：终端里 defaults write 改了也同步到界面
+    private func watchAutoMount() {
+        let dir = (AutoMount.domain as NSString).deletingLastPathComponent
+        let fd = open(dir, O_EVTONLY)
+        guard fd >= 0 else { return }
+        let src = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd,
+            eventMask: [.write, .delete, .rename],
+            queue: watchQueue
+        )
+        src.setEventHandler { [weak self] in
+            let value = AutoMount.withoutLogin
+            Task { @MainActor in
+                guard let self, self.autoMountNoLogin != value else { return }
+                self.autoMountNoLogin = value
+            }
         }
         src.setCancelHandler { close(fd) }
         src.resume()
@@ -87,12 +112,14 @@ final class AppState: ObservableObject {
             let sizeGB = MemoryDisk.sizeGB
             let auto = MemoryDisk.autoCreate
             let links = MemoryDisk.links()
-            let protect = ConfigStore.read().protectEject ?? true
-            let autoMount = AutoMount.withoutLogin
-            let entries = ConfigStore.read().entryPaths ?? [:]
+            let cfg = ConfigStore.read()
+            let protect = cfg.volumes.allSatisfy { $0.protectEject }
+            let entries = Dictionary(cfg.volumes.map { ($0.uuid.uppercased(), $0.entryPath) },
+                                     uniquingKeysWith: { a, _ in a })
             await MainActor.run {
                 self.volumes = vols
                 self.registeredCount = conf.count
+                self.registeredUUIDs = Set(cfg.volumes.map { $0.uuid.uppercased() })
                 self.serviceInstalled = installed
                 self.serviceNeedsUpgrade = upgrade
                 self.memoryMounted = mounted
@@ -100,7 +127,6 @@ final class AppState: ObservableObject {
                 self.memoryAuto = auto
                 self.memoryLinks = links
                 self.protectEject = protect
-                self.autoMountNoLogin = autoMount
                 self.entryPaths = entries
                 self.scanning = false
                 if self.needsRescan {
@@ -112,28 +138,18 @@ final class AppState: ObservableObject {
     }
 
     func setProtectEject(_ on: Bool) {
-        ConfigStore.update { $0.protectEject = on }
+        ConfigStore.update { c in
+            for i in c.volumes.indices { c.volumes[i].protectEject = on }
+        }
         protectEject = on
         notify(on ? "已开启防止推出（登记的磁盘无法被推出）" : "已关闭防止推出")
     }
 
     /// 系统级开关：登录窗口（无用户登录）是否自动挂载硬盘
     func setAutoMountNoLogin(_ on: Bool) {
-        if ServiceInstaller.installed {
-            // 交给 root 守护写系统 plist，App 不提权
-            ConfigStore.update { $0.autoMountNoLogin = on }
-            Daemon.tick(Daemon.tickPass)
-            autoMountNoLogin = on
-            notify(on ? "已允许未登录时自动挂载硬盘" : "已禁止未登录时自动挂载硬盘（登录后再挂）")
-            Task {
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                refresh()
-            }
-        } else {
-            runPrivileged(on ? "已允许未登录时自动挂载硬盘" : "已禁止未登录时自动挂载硬盘") {
-                try ServiceInstaller.setAutoMount(on)
-                return nil
-            }
+        runPrivileged(on ? "已允许未登录时自动挂载硬盘" : "已禁止未登录时自动挂载硬盘") {
+            try ServiceInstaller.setAutoMount(on)
+            return nil
         }
     }
 
@@ -177,9 +193,12 @@ final class AppState: ObservableObject {
     func toggleNobrowse(_ v: Volume) {
         let on = !v.nobrowse
         // 记下偏好：守护开机/回挂时照此挂载
-        var list = VolumeScanner.persistedNobrowse()
-        if on { list.insert(v.uuid.uppercased()) } else { list.remove(v.uuid.uppercased()) }
-        ConfigStore.update { $0.nobrowse = list.sorted() }
+        let key = v.uuid.uppercased()
+        ConfigStore.update { c in
+            if let i = c.volumes.firstIndex(where: { $0.uuid.uppercased() == key }) {
+                c.volumes[i].nobrowse = on
+            }
+        }
 
         guard !v.deviceNode.isEmpty, v.mounted else {
             notify(on ? "已记下设置，挂载后生效" : "已取消")
@@ -190,8 +209,9 @@ final class AppState: ObservableObject {
         let dev = v.deviceNode
         let mp = v.mountPoint
         let name = v.name
-        let entryRaw = (ConfigStore.read().entryPaths ?? [:])[v.uuid.uppercased()] ?? ""
-        let entryUUID = v.uuid.uppercased()
+        let desired = (entryPaths[key] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let storedRaw = ConfigStore.read().volumes
+            .first { $0.uuid.uppercased() == key }?.entryPath ?? ""
         busy = true
         Task.detached(priority: .userInitiated) {
             var r = Shell.run("/usr/sbin/diskutil", ["unmount", dev])
@@ -206,14 +226,12 @@ final class AppState: ObservableObject {
                 // 访达里看不到时，默认在用户目录留一个同名的入口（符号链接）
                 let fm = FileManager.default
                 // 入口位置：用编辑框里的值，留空就是 ~/卷名
-                let raw = entryRaw.isEmpty ? "~/\(name)" : entryRaw
+                let raw = desired.isEmpty ? "~/\(name)" : desired
                 let entry = (raw as NSString).expandingTildeInPath
                 if on {
                     // 位置改过：先删掉上次创建的入口链接，避免重复创建
-                    let key = mp.isEmpty ? "" : entryUUID
-                    let oldRaw = (ConfigStore.read().entryLinks ?? [:])[key] ?? ""
-                    if !oldRaw.isEmpty, oldRaw != raw {
-                        let oldPath = (oldRaw as NSString).expandingTildeInPath
+                    if !storedRaw.isEmpty, storedRaw != raw {
+                        let oldPath = (storedRaw as NSString).expandingTildeInPath
                         if let d = try? fm.destinationOfSymbolicLink(atPath: oldPath), d == mp {
                             try? fm.removeItem(atPath: oldPath)
                         }
@@ -222,13 +240,23 @@ final class AppState: ObservableObject {
                        (try? fm.destinationOfSymbolicLink(atPath: entry)) == nil {
                         try? fm.createSymbolicLink(atPath: entry, withDestinationPath: mp)
                     }
-                    ConfigStore.update { $0.entryLinks = Self.upsert(c: $0.entryLinks, key: key, value: raw) }
+                    ConfigStore.update { c in
+                        if let i = c.volumes.firstIndex(where: { $0.uuid.uppercased() == key }) {
+                            c.volumes[i].entryPath = raw
+                        }
+                    }
                     msg = "「\(name)」已从桌面和访达侧边栏隐藏；入口：\(raw)"
                 } else {
-                    if let dest = try? fm.destinationOfSymbolicLink(atPath: entry), dest == mp {
-                        try? fm.removeItem(atPath: entry)
+                    let oldEntry = (storedRaw.isEmpty ? raw : storedRaw) as NSString
+                    let oldPath = oldEntry.expandingTildeInPath
+                    if let dest = try? fm.destinationOfSymbolicLink(atPath: oldPath), dest == mp {
+                        try? fm.removeItem(atPath: oldPath)
                     }
-                    ConfigStore.update { $0.entryLinks = Self.upsert(c: $0.entryLinks, key: entryUUID, value: "") }
+                    ConfigStore.update { c in
+                        if let i = c.volumes.firstIndex(where: { $0.uuid.uppercased() == key }) {
+                            c.volumes[i].entryPath = ""
+                        }
+                    }
                     msg = "「\(name)」已恢复在访达中显示"
                 }
             }
@@ -244,30 +272,23 @@ final class AppState: ObservableObject {
     // MARK: - 登记（提权）
 
     func register(_ v: Volume) {
-        var entries = ConfStore.load()
-        entries.removeAll { $0.uuid == v.uuid }
-        entries.append(ConfEntry(label: v.name, uuid: v.uuid,
-                                 owner: "\(getuid()):\(getgid())"))
-        do {
-            try ConfStore.save(entries: entries)
-            notify(ServiceInstaller.installed
-                   ? "已登记「\(v.name)」"
-                   : "登记成功；回挂服务尚未安装，登记暂不生效")
-        } catch {
-            fail(error.localizedDescription)
+        let protect = protectEject
+        ConfigStore.update { c in
+            if let i = c.volumes.firstIndex(where: { $0.uuid == v.uuid }) {
+                c.volumes[i].label = v.name
+            } else {
+                c.volumes.append(.init(label: v.name, uuid: v.uuid, protectEject: protect))
+            }
         }
+        notify(ServiceInstaller.installed
+               ? "已登记「\(v.name)」"
+               : "登记成功；回挂服务尚未安装，登记暂不生效")
         refresh()
     }
 
     func unregister(_ v: Volume) {
-        var entries = ConfStore.load()
-        entries.removeAll { $0.uuid == v.uuid }
-        do {
-            try ConfStore.save(entries: entries)
-            notify("已从回挂配置移除「\(v.name)」")
-        } catch {
-            fail(error.localizedDescription)
-        }
+        ConfigStore.update { $0.volumes.removeAll { $0.uuid == v.uuid } }
+        notify("已从回挂配置移除「\(v.name)」")
         refresh()
     }
 
@@ -291,48 +312,46 @@ final class AppState: ObservableObject {
         }
         let fm = FileManager.default
         let key = v.uuid.uppercased()
-        let cfg = ConfigStore.read()
-        // 位置改过：先把这条卷上次创建的入口链接删掉，避免重复创建
-        let oldRaw = (cfg.entryLinks ?? [:])[key] ?? (cfg.entryPaths ?? [:])[key] ?? ""
-        if !oldRaw.isEmpty, !v.mountPoint.isEmpty {
-            let oldPath = (oldRaw as NSString).expandingTildeInPath
-            if oldPath != path,
-               let dest = try? fm.destinationOfSymbolicLink(atPath: oldPath),
-               dest == v.mountPoint {
-                try? fm.removeItem(atPath: oldPath)
+        let oldRaw = ConfigStore.read().volumes
+            .first { $0.uuid.uppercased() == key }?.entryPath ?? ""
+        // 目标位置已被占用且不是本卷的链接，直接失败，旧入口保持不动
+        if let dest = try? fm.destinationOfSymbolicLink(atPath: path) {
+            guard dest == v.mountPoint else {
+                fail("该位置已存在：\(path)")
+                return
             }
-        }
-        if fm.fileExists(atPath: path) {
+        } else if fm.fileExists(atPath: path) {
             fail("该位置已存在：\(path)")
             return
         }
         do {
-            try fm.createSymbolicLink(atPath: path, withDestinationPath: v.mountPoint)
-            setEntryPath(raw, for: v)
-            ConfigStore.update { $0.entryLinks = Self.upsert(c: $0.entryLinks, key: key, value: raw) }
+            if (try? fm.destinationOfSymbolicLink(atPath: path)) == nil {
+                try fm.createSymbolicLink(atPath: path, withDestinationPath: v.mountPoint)
+            }
+            // 新入口建好后再清理旧入口
+            if !oldRaw.isEmpty, !v.mountPoint.isEmpty {
+                let oldPath = (oldRaw as NSString).expandingTildeInPath
+                if oldPath != path,
+                   let dest = try? fm.destinationOfSymbolicLink(atPath: oldPath),
+                   dest == v.mountPoint {
+                    try? fm.removeItem(atPath: oldPath)
+                }
+            }
+            entryPaths[key] = raw
+            ConfigStore.update { c in
+                if let i = c.volumes.firstIndex(where: { $0.uuid.uppercased() == key }) {
+                    c.volumes[i].entryPath = raw
+                }
+            }
             notify("已创建入口：\(path)")
         } catch {
             fail(error.localizedDescription)
         }
     }
 
-    /// 写入/删除字典项（空值表示删除）
-    nonisolated private static func upsert(c: [String: String]?, key: String, value: String) -> [String: String] {
-        var m = c ?? [:]
-        if value.isEmpty { m.removeValue(forKey: key) } else { m[key] = value }
-        return m
-    }
-
-    /// 记录某卷的入口位置（留空表示默认 ~/卷名）
+    /// 编辑框里的入口位置：只改界面，真正写入配置要等「创建入口」成功
     func setEntryPath(_ text: String, for v: Volume) {
-        let key = v.uuid.uppercased()
-        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        entryPaths[key] = t
-        ConfigStore.update { c in
-            var m = c.entryPaths ?? [:]
-            if t.isEmpty { m.removeValue(forKey: key) } else { m[key] = t }
-            c.entryPaths = m
-        }
+        entryPaths[v.uuid.uppercased()] = text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     func installService() {
