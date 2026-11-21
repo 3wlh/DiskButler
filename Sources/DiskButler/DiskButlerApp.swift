@@ -16,7 +16,7 @@ struct DiskButlerApp: App {
     }
 }
 
-/// 无 Dock 图标、无菜单栏图标，仅在被手动打开时显示窗口
+/// 运行时显示 Dock 图标，不显示菜单栏图标；关闭窗口即退出
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 旧版本留下的「登录后打开面板」LaunchAgent：开关已移除，顺手清理
@@ -25,7 +25,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             _ = Shell.run("/bin/launchctl", ["bootout", "gui/\(getuid())/com.local.diskbutler"])
             try? FileManager.default.removeItem(atPath: legacy)
         }
-        NSApp.setActivationPolicy(.accessory)
+        NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
     }
 

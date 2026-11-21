@@ -234,6 +234,13 @@ enum Daemon {
         schedulePass()
     }
 
+    /// 新设备出现（开机时 USB 常晚于守护启动）：立刻跑一轮，把登记卷挂上，
+    /// 不再依赖 /Volumes 变化或用户手动打开 App
+    static func handleDiskAppeared() {
+        log("设备出现，跑一轮")
+        schedulePass()
+    }
+
     // MARK: - 通知通道（notifyd，不落盘）
 
     private static var notifyToken: Int32 = 0
@@ -275,6 +282,7 @@ enum Daemon {
         DASessionSetDispatchQueue(session, daQueue)
         DARegisterDiskUnmountApprovalCallback(session, nil, daApproval, nil)
         DARegisterDiskEjectApprovalCallback(session, nil, daApproval, nil)
+        DARegisterDiskAppearedCallback(session, nil, daDiskAppeared, nil)
         daSession = session
         log("防止推出：已注册")
     }
@@ -467,4 +475,8 @@ enum Daemon {
 /// DiskArbitration 回调必须是 C 函数指针，不能捕获上下文，因此放在文件作用域
 private func daApproval(_ disk: DADisk, _ context: UnsafeMutableRawPointer?) -> Unmanaged<DADissenter>? {
     Daemon.approve(disk)
+}
+
+private func daDiskAppeared(_ disk: DADisk, _ context: UnsafeMutableRawPointer?) {
+    Daemon.handleDiskAppeared()
 }
